@@ -1,0 +1,646 @@
+---
+title: "Predicting Postoperative In-Hospital Mortality for Non-Emergency Procedures Using the INSPIRE Dataset."
+author: "Douglas Snyder, MD"
+bibliography: bibliography.bib
+csl: nature.csl
+link-bibliography: false
+format: 
+  pdf:
+    include-in-header:
+      - text: '\usepackage[none]{hyphenat}'
+      - text: '\usepackage{titling}'
+      - text: '\setlength{\droptitle}{-2cm}'
+      - text: '\pretitle{\begin{center}\LARGE\bfseries}'
+      - text: '\posttitle{\par\end{center}\vskip 0.5em}'
+      - text: '\postauthor{\end{tabular}\par\end{center}\vspace{-2cm}}'
+      - text: '\pagenumbering{gobble}'
+      - text: '\usepackage{float}'
+    margin-top: '25.4mm'
+    margin-bottom: '25.4mm'
+    margin-left: '25.4mm'
+    margin-right: '25.4mm'
+editor_options: 
+  chunk_output_type: inline
+# It was a requirement for the course that all code be included in the manuscript file,
+# and that it not be displayed
+execute:
+  echo: false
+  output: false
+---
+
+```{r}
+if(!file.exists("RDS")){
+  dir.create("RDS")
+}
+library(knitr)
+library(kableExtra)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(broom)
+library(modeest)
+library(caret)
+library(randomForest)
+library(tableone)
+library(pROC)
+library(ggplot2)
+library(gridExtra)
+library(stringr)
+library(car)
+```
+
+
+# Introduction
+Preoperative evaluation is a critical component for patients undergoing anesthesia for both operative and non-operative procedures. The guidelines provided by the American Society of Anesthesiologists (ASA) give considerations for how patients should be evaluated prior to undergoing an anesthetic[@committee_on_standards_and_practice_parameters_practice_2012].  A complete review of the patient's history involves collection of data on pertinent medical history, physical exam findings, and labs.  Much of these data are available in electronic medical records (EMR), which can be reviewed and provide potential insights on patient outcomes.
+
+Although EMR data is typically rigorously secured to guard patient privacy, some institutions have undertaken the task of anonymization and publication of data to allow for research without the usual hurdles that accompany the use of an unredacted EMR.  One such dataset is the Innovative Solutions for Pioneering Intensive Care Research (INSPIRE)[@lee_inspire_nodate; @goldberger_physiobank_2000].  INSPIRE includes 130,000 anesthetic cases from an academic medical center in Korea and contains information from pre-procedure evaluation to hospital discharge or death.  Patient demographics, labs, medications, diagnoses, and vital sign measurements are provided.  The following is a summary of in hospital deaths for procedures labeled as emergency or not, broken down by ASA physical status.  ASA physical status gives a rough grade of overall patient health that often correlates with outcomes[@horvath_evolution_2021].
+
+```{r}
+# RDS files were generated to speed up knitting while writing manuscript
+if(file.exists("RDS/intro_death_pct_table.RDS")){
+  intro_death_pct_table <- readRDS("RDS/intro_death_pct_table.RDS")
+} else {
+  operations <- read_csv("csv/operations.csv")
+  
+  # Calculate Deaths by ASA status and Emergency designation
+  intro_death_pct_table <- operations |> mutate(inhosp_death=if_else(is.na(inhosp_death_time), 0,1)) |>
+    group_by(subject_id) |> 
+    summarize(asa=mfv1(asa), inhosp_death=max(inhosp_death), emop=last(emop)) |> 
+    ungroup() |> group_by(asa, emop) |>
+    summarize(pct_death=100*mean(inhosp_death), .groups="drop") |> 
+    pivot_wider(names_from=emop, names_prefix="emop_", values_from=pct_death) 
+  saveRDS(intro_death_pct_table, "RDS/intro_death_pct_table.RDS")
+}
+intro_death_pct_table$emop_0[5] <- NA #ASA 5 patients do not have non-emergency procedures.
+
+# Generate first table; this will be displayed in the tables and figures section, 
+# as required for the course.
+table_1 <- intro_death_pct_table |> filter(!is.na(asa)) |>
+  rename("ASA Physical Status"=asa, "Non-Emergency Procedure"=emop_0, "Emergency Procedure"=emop_1) |> 
+  kable(caption = "In Hospital Death Rate (\\%)", booktabs=TRUE, digits=1, align="lll") |> 
+  kable_styling(latex_options = "HOLD_position", full_width = FALSE) |> 
+  column_spec(1:3, width="3.5cm")
+```
+
+As seen in Table 1, in hospital mortality is not common among the healthiest patients (ASA 1 and 2) undergoing non-emergency procedures, with lest than 1% of patients dying in the hospital. Death occurs with greater frequency for patients with more severe disease as seen for patients who are designated as ASA 3 or 4 physical status.  Emergency procedures cannot be delayed, by definition.  Some of the deaths seen for non-emergent procedures, however, might be avoided if the factors that are influential mortality could be intervened upon.  Knowing which features relate to mortality can also allow for better risk stratification and patient discussion for informed consent.
+
+# Methods
+Cases were filtered to focus on elective procedures, to the degree possible using available data.    Procedures that were classified in the operations table as emergency were excluded.  To further reduce the number of likely non-elective cases, any patient who was recorded as being admitted to the ICU prior to entry to the OR was excluded.  Vital sign records demonstrated that some patients had need of a ventilator, the use of extracorporeal membrane oxygenation (ECMO), or intra-aortic balloon pump (IABP) prior to surgery.  These devices are only used in critically ill patients; any procedures done are extremely unlikely to be elective, so these patients were excluded from this review.  ASA category 5 is typically reserved for patients who are critically ill and are not likely to survive without an operation; making their procedure almost by definition non-elective.  Patients who are brain dead are classified as ASA 6 and are physically alive until such a time as organ harvesting can take place, so these patients were not considered.  Since subsequent procedures and hospitalizations may represent complications of the initial procedure, which would not be in keeping with the focus on elective procedures, only the first procedure of the first hospitalization was considered.
+
+Impossible values of heights and weights were removed, and BMI was calculated for use as a covariate.  BMI values over 40 were only retained if the patient had an ICD-10 code related to being overweight or obese.  Vital signs and laboratory values were selected from those that were reported prior to the time that patients entered the operating room.  Missing vital signs and lab values were imputed with normal values under the assumption that values would be normal if there was no indication to check.  Considerations on which diagnosis were considered were selected based on whether their chart time was entered prior to entry into the operating room to avoid making predictions based on events that occurred later in the patients hospital course.  ASA 1 physical status is reserved for patients who are healthy and have medical comorbidities, so patients were considered to have complete diagnostic information if some diagnostic record was found for them or they were classified as ASA 1 physical status.  Patients without diagnostic information were excluded.  The data were split into a training and test set to allow for validation of models.  Patients with incomplete data were excluded from analysis.
+
+```{r}
+if(file.exists("RDS/train.RDS") &
+   file.exists("RDS/test.RDS") &
+   file.exists("RDS/labs_preop.RDS") &
+   file.exists("RDS/diag_preop.RDS") &
+   file.exists("RDS/vitals_preop.RDS")){
+  train <- readRDS("RDS/train.RDS")
+  test <- readRDS("RDS/test.RDS")
+  labs_preop <- readRDS("RDS/labs_preop.RDS")
+  diag_preop <- readRDS("RDS/diag_preop.RDS")
+  vitals_preop <- readRDS("RDS/vitals_preop.RDS")
+} else {
+  # Read in files from the INSPIRE data set and restrict to the preop time period.
+  operations <- read_csv("csv/operations.csv")
+  labs <- read_csv("csv/labs.csv")
+  diagnosis <- read_csv("csv/diagnosis.csv")
+  medications <- read_csv("csv/medications.csv")
+  ward_vitals <- read_csv("csv/ward_vitals.csv")
+  
+  # Read in data from the operations table and exclude patients who had emergency operations
+  processed_data <- operations |> group_by(hadm_id) |> 
+    mutate(inhosp_death=if_else(is.na(inhosp_death_time), 0, 1)) |>
+    mutate(inhosp_death = max(inhosp_death)) |> 
+    ungroup() |> 
+    group_by(subject_id) |> 
+    filter(emop==0) |>
+    filter(asa != 6) |>
+    arrange(admission_time, orin_time) |>
+    slice_head(n=1) |>
+    ungroup() |> select(-hadm_id, -case_id, -opdate)
+
+  # Some patients had vital signs indicating that they were ventilated, on a balloon pump (IABP), 
+  # Or required ECMO prior to non-emergency surgery; these critically ill patients were
+  # Almost certainly not undergoing elective procedures.
+  subject_exclusions <- ward_vitals |> filter(item_name %in% c("vent", "iabp", "ecmo")) |>
+    left_join(processed_data, by="subject_id") |>
+    filter(chart_time < orin_time) |> pull(subject_id) |> unique()
+
+  # Apply vital sign exclusions, remove patients who were in the ICU preoperatively,
+  # And remove any patient who was ASA 5 (as these cases are not elective by definition)
+  processed_data <- processed_data |>
+    filter(! subject_id %in% subject_exclusions) |>
+    filter(is.na(icuin_time) | icuin_time > orin_time) |>
+    filter(asa != 5) |>
+    select(-anstart_time, -anend_time, -cpbon_time, -cpboff_time, -icuin_time, 
+           -icuout_time, -inhosp_death_time, -opstart_time, -opend_time)
+  
+  # Process height and weight and try to remove patients who have values that are completely
+  # impossible.
+  # The shortest adult in the world is 54.6 cm, the tallest is 251 cm
+  processed_data$height[!between(processed_data$height, 54.6, 251)] <- NA
+  # remove completely impossible weights
+  processed_data$weight[!between(processed_data$weight, 5, 500)] <- NA
+  
+  # calculate BMI
+  processed_data <- processed_data |> mutate(bmi=weight/((height/100)^2))
+  
+  # Remove impossible bmi valuesl 12 was an arbitrary cutoff that is likely lower
+  # than what is actually physically possible.
+  processed_data$weight[processed_data$bmi < 12] <- NA
+  processed_data$bmi[processed_data$bmi < 12] <- NA
+  
+  # Filter by time to limit data to the preop time period.
+  # Preop labs, meds and dagnosis
+  labs_preop <- processed_data |> select(subject_id, admission_time, orin_time, orout_time) |> 
+    right_join(labs, by="subject_id") |> filter(chart_time < orin_time) |>
+    select(-admission_time, -orin_time, -orout_time)
+  
+  diag_preop <- processed_data |> select(subject_id, admission_time, orin_time, orout_time) |> 
+    right_join(diagnosis, by="subject_id") |> 
+    filter(chart_time < orin_time) |>
+    select(-admission_time, -orin_time, -orout_time)
+  
+  vitals_preop <- processed_data |> select(subject_id, admission_time, orin_time, orout_time) |> 
+    right_join(ward_vitals, by="subject_id") |>
+    filter(chart_time < orin_time) |>
+    select(-admission_time, -orin_time, -orout_time)
+  
+  # set NA for BMI > 40 unless there is an icd10_cm
+  high_bmi_dx_subjects <- diag_preop |> filter(icd10_cm == "E66") |>
+    select(subject_id) |> unique() |> unlist()
+  processed_data <- processed_data |> mutate(bmi = if_else(bmi < 40 | subject_id %in% high_bmi_dx_subjects, bmi, NA),
+                       weight = if_else(bmi < 40 | subject_id %in% high_bmi_dx_subjects, weight, NA))
+  
+  # Mark subjects as not having diagnostic information if they lack a preop dx, unless they are ASA 1
+  preop_dx_subjects <- diag_preop |> select(subject_id) |> unique() |> unlist()
+  processed_data <- processed_data |> mutate(has_dx=if_else(subject_id %in% preop_dx_subjects | asa==1, 1, NA))
+  
+  # Split the processed data into training and test sets.
+  set.seed(1)
+  train_index <- createDataPartition(processed_data$inhosp_death, times = 1, p = 0.8, list = FALSE)
+  train <- processed_data[train_index,]
+  test <- processed_data[-train_index,]
+  
+  saveRDS(train, "RDS/train.RDS")
+  saveRDS(test, "RDS/test.RDS")
+  saveRDS(labs_preop, "RDS/labs_preop.RDS")
+  saveRDS(diag_preop, "RDS/diag_preop.RDS")
+  saveRDS(vitals_preop, "RDS/vitals_preop.RDS")
+}
+```
+
+```{r}
+# Incomplete Case Exclusions, recording how many were present before exclusions
+# to report in the manuscript. 
+n_row_complete_train <- nrow(train)
+n_row_complete_test <- nrow(test)
+train <- train[complete.cases(train),]
+test <- test[complete.cases(test),]
+```
+
+Although the ICD-10 codes for procedures and diagnoses were truncated for the purposes of anonymization in INSPIRE, there were still over 1000 unique diagnostic codes and over 2000 unique procedure codes.  A random forest with 200 trees was generated to determine the importance of features as a way to narrow down this list for further consideration.  Cofactors were given further consideration if they had some predictive utility in predicting both the outcome of death or not death according to the importance measure of the random forest.  In order to create a model with interpretable parameters, logistic regression models were created.  An initial model was created based on those features that were identified as important by the random forest tree.  Further selection of parameters was based on clinical judgment, assessment of collinearity, and statistical significance.  Due to the rareness and severity of the outcome, a Bonferroni correction was not employed when selecting features for the final model to allow for a larger number of possible predictors of mortality.  Descriptions for the ICD codes from the final model were referenced manually using an online database[@noauthor_icd10datacom_nodate].  In the final model, laboratory values were considered in comparison with normal reference ranges [@american_college_of_physicians_laboratory_nodate] to aid in the interpretation.
+
+```{r}
+# Create wide (pivoted) versions of Labs, Vitals, and Diagnosis
+# Labs
+if(file.exists("RDS/labs_wide_train.RDS") & file.exists("RDS/labs_wide_test.RDS")){
+  labs_wide_train <- readRDS("RDS/labs_wide_train.RDS")
+  labs_wide_test <- readRDS("RDS/labs_wide_test.RDS")
+} else {
+  labs_preop_train <- train |> select(subject_id) |> 
+    left_join(labs_preop, by="subject_id") |> 
+    group_by(subject_id, item_name) |>
+    arrange(chart_time) |>
+    slice_tail(n=1) |>
+    ungroup() |>
+    select(subject_id, item_name, value, chart_time)
+  
+  n_train_subjects <- length(unique(labs_preop_train$subject_id))
+  labs_summary <- labs_preop_train |> 
+    group_by(item_name) |>
+    summarize(coverage=n()/n_train_subjects, mu=mean(value), sigma=sd(value))
+  
+  # the normal values for troponin, d_dimer, and lactate should be zero, not the mean for those people who had it checked.
+  labs_summary$mu[labs_summary$item_name %in% c("troponin_i", "d_dimer", "lacate")] <- 0
+  
+  labs_wide_train <- labs_preop_train |>
+    left_join(labs_summary, by="item_name") |>
+    filter(coverage>0.01) |>
+    select(subject_id, item_name, value) |>
+    pivot_wider(names_from = item_name)
+  
+  labs_wide_train <- train |> select(subject_id) |> left_join(labs_wide_train, by="subject_id")
+  
+  for (col in labs_summary$item_name) {
+    if(col %in% colnames(labs_wide_train)){
+      labs_wide_train[is.na(labs_wide_train[, col]), col] <- labs_summary$mu[match(col, labs_summary$item_name)]
+    }
+  }
+  
+  ## Test - Using mean and sigma from test data so that to be a more valid prediction model.
+  labs_preop_test <- test |> select(subject_id) |> 
+    left_join(labs_preop, by="subject_id") |> 
+    group_by(subject_id, item_name) |>
+    arrange(chart_time) |>
+    slice_tail(n=1) |>
+    ungroup() |>
+    select(subject_id, item_name, value, chart_time)
+  
+  labs_wide_test <- labs_preop_test |> 
+    left_join(labs_summary, by="item_name") |> 
+    filter(coverage>0.01) |>
+    select(subject_id, item_name, value) |>
+    pivot_wider(names_from = item_name) |>
+    select(colnames(labs_wide_train))
+  
+  labs_wide_test <- test |> select(subject_id) |> left_join(labs_wide_test, by="subject_id")
+  
+  for (col in labs_summary$item_name) {
+    if(col %in% colnames(labs_wide_test)){
+      labs_wide_test[is.na(labs_wide_test[, col]), col] <- labs_summary$mu[match(col, labs_summary$item_name)]
+    }
+  }
+  saveRDS(labs_wide_train, "RDS/labs_wide_train.RDS")
+  saveRDS(labs_wide_test, "RDS/labs_wide_test.RDS")
+}
+
+## Vitals
+if(file.exists("RDS/vitals_wide_train.RDS") & file.exists("RDS/vitals_wide_test.RDS")){
+  vitals_wide_train <- readRDS("RDS/vitals_wide_train.RDS")
+  vitals_wide_test <- readRDS("RDS/vitals_wide_test.RDS")
+} else {
+  vitals_train <- train |> select(subject_id) |> 
+    left_join(vitals_preop, by="subject_id") |> 
+    group_by(subject_id, item_name) |>
+    arrange(chart_time) |>
+    slice_tail(n=1) |> 
+    ungroup() |>
+    select(subject_id, item_name, value, chart_time)
+  
+  vitals_summary <- vitals_train |> 
+    group_by(item_name) |>
+    summarize(mu=mean(value), sigma=sd(value)) |> na.omit()
+  
+  vitals_wide_train <- vitals_train |> 
+    select(subject_id, item_name, value) |>
+    pivot_wider(names_from = item_name) |>
+    select(-"NA")
+  
+  for (col in vitals_summary$item_name) {
+    vitals_wide_train[is.na(vitals_wide_train[, col]), col] <- vitals_summary$mu[match(col, vitals_summary$item_name)]
+  }
+  vitals_wide_train$nibp_mbp = vitals_wide_train$nibp_dbp + (vitals_wide_train$nibp_sbp-vitals_wide_train$nibp_dbp)/3
+  
+  
+  ## Test
+  vitals_test <- test |> select(subject_id) |> 
+    left_join(vitals_preop, by="subject_id") |> 
+    group_by(subject_id, item_name) |>
+    arrange(chart_time) |>
+    slice_tail(n=1) |> 
+    ungroup() |>
+    select(subject_id, item_name, value, chart_time)
+  
+  vitals_wide_test <- vitals_test |> 
+    select(subject_id, item_name, value) |>
+    pivot_wider(names_from = item_name) |>
+    select(colnames(vitals_wide_train))
+  
+  for (col in vitals_summary$item_name) {
+    vitals_wide_test[is.na(vitals_wide_test[, col]), col] <- vitals_summary$mu[match(col, vitals_summary$item_name)]
+  }
+  vitals_wide_test$nibp_mbp = vitals_wide_test$nibp_dbp + (vitals_wide_test$nibp_sbp-vitals_wide_test$nibp_dbp)/3
+  saveRDS(vitals_wide_train, "RDS/vitals_wide_train.RDS")
+  saveRDS(vitals_wide_test, "RDS/vitals_wide_test.RDS")
+}
+
+## Diagnoses
+if(file.exists("RDS/diag_wide_train.RDS") & file.exists("RDS/diag_wide_test.RDS")){
+  diag_wide_train <- readRDS("RDS/diag_wide_train.RDS")
+  diag_wide_test <- readRDS("RDS/diag_wide_test.RDS")
+} else {
+  diag_wide <- diag_preop |> select(subject_id, icd10_cm) |> unique() |>
+    mutate(icd10_cm=paste0("diag_", icd10_cm), value=1) |> 
+    pivot_wider(names_from=icd10_cm, values_fill = 0)
+  
+  diag_wide_train <- train |> select(subject_id) |> left_join(diag_wide, by="subject_id") |>
+    mutate(across(everything(), ~replace_na(., 0)))
+  
+  diag_wide_test <- test |> select(subject_id) |> left_join(diag_wide, by="subject_id") |>
+    mutate(across(everything(), ~replace_na(., 0)))
+  
+  saveRDS(diag_wide_train, "RDS/diag_wide_train.RDS")
+  saveRDS(diag_wide_test, "RDS/diag_wide_test.RDS")
+}
+```
+
+```{r}
+# Create versions of test and train with all features as columns to be used in a random forest model.
+train_all_cols <- train |> 
+  select(subject_id, inhosp_death, age, sex, bmi, asa, department, antype, icd10_pcs) |> 
+  mutate(sex=if_else(sex=="F", 1, 0)) |>
+  mutate(value=1) |> pivot_wider(names_from = antype, names_prefix = "antype_", values_fill=0) |>
+  mutate(value=1) |> pivot_wider(names_from = asa, names_prefix = "ASA", values_fill=0) |>
+  mutate(value=1) |> pivot_wider(names_from = department, names_prefix="dept_", values_fill=0) |>
+  left_join(labs_wide_train, by="subject_id") |> 
+  left_join(vitals_wide_train, by="subject_id") |>
+  mutate(value=1) |> pivot_wider(names_from = icd10_pcs, names_prefix = "proc_", values_fill=0) |>
+  left_join(diag_wide_train, by="subject_id") |>
+  select(-subject_id)
+
+test_all_cols <- test |> 
+  select(subject_id, inhosp_death, age, sex, bmi, asa, department, antype, icd10_pcs) |> 
+  mutate(sex=if_else(sex=="F", 1, 0)) |>
+  mutate(value=1) |> pivot_wider(names_from = antype, names_prefix = "antype_", values_fill=0) |>
+  mutate(value=1) |> pivot_wider(names_from = asa, names_prefix = "ASA", values_fill=0) |>
+  mutate(value=1) |> pivot_wider(names_from = department, names_prefix="dept_", values_fill=0) |>
+  left_join(labs_wide_test, by="subject_id") |> 
+  left_join(vitals_wide_test, by="subject_id") |>
+  mutate(value=1) |> pivot_wider(names_from = icd10_pcs, names_prefix = "proc_", values_fill=0) |>
+  left_join(diag_wide_test, by="subject_id") |>
+  select(-subject_id)
+
+# Make sure the test set has the all the columns from the training set, and that the columns are in the same order.
+tmp <- colnames(train_all_cols)
+empty_procs <- tmp[!tmp %in% colnames(test_all_cols)]
+for(proc in empty_procs){
+  test_all_cols[[proc]] <- 0
+}
+test_all_cols <- test_all_cols[,colnames(train_all_cols)]
+
+# Create the random forest model
+if(file.exists("RDS/rf_model_200.RDS")){
+  rf_model <- readRDS("RDS/rf_model_200.RDS")
+} else {
+  rf_model <- randomForest(y=as.factor(train_all_cols$inhosp_death), 
+                           x=train_all_cols[,-1], 
+                           ntree = 200, 
+                           importance=TRUE,
+                           do.trace=TRUE)
+  saveRDS(rf_model, "RDS/rf_model_200.RDS")
+}
+
+# Extract the important features from the random forest model
+importance_tbl <- as_tibble(importance(rf_model), rownames="cofactor") |> rename(X0="0", X1="1")
+important_features <- importance_tbl |> filter(MeanDecreaseGini > 0.5 & X0!=0 & X1 !=0) |> pull(cofactor)
+#importance_tbl |> filter(MeanDecreaseGini > 0.5 & X0!=0 & X1 !=0) #|> arrange(desc(MeanDecreaseAccuracy))
+```
+# Results
+```{r}
+n_complete_cases <- n_row_complete_train+n_row_complete_test
+n_final_cases <- nrow(train) + nrow(test)
+pct_missing <- 100*(n_complete_cases-n_final_cases)/n_complete_cases
+```
+After filtering the data to consider cases determined to be elective and including only a patient's first procedure, there were `r prettyNum(n_complete_cases, big.mark = ",")` patients.  Missing data was found in `r sprintf("%0.1f", pct_missing)` percent of these, leaving `r prettyNum(n_final_cases, big.mark= ",")` patients, which were divided into `r prettyNum(nrow(train), big.mark=",")` for the training set and `r prettyNum(nrow(train), big.mark=",")` for the test set.  Demographics for these patients are summarized in Table 2.
+
+```{r}
+# Create demographics table (usually table one in a paper)
+library(tableone)
+demographics_df <- bind_rows(list(Train=train, Test=test), .id="Set") |> 
+  rename(Age=age, Sex=sex, Race=race, BMI=bmi, "Anesthesia Type"=antype, "Height in cm"=height, "Weight in kg"=weight) |>
+  mutate(Set=factor(Set, levels=c("Train", "Test")),
+         "Death"=if_else(inhosp_death==1, "Y", "N"),
+         "ASA Physical Status"=factor(asa),
+         Race=as.factor(Race),
+         )
+
+# Table One is not table_1, but course requirements were that 10% of our grade was having a table in the introduction.
+demographics_t1 <- CreateTableOne(vars=c("Death", "Age", "Sex", "Race", "Height in cm", "Weight in kg", "BMI", "ASA Physical Status", "Anesthesia Type"), strata="Set", addOverall=TRUE, test=FALSE, data=demographics_df)
+
+table_2 <- kableone(demographics_t1, booktabs=TRUE, caption="Demographic Information", 
+         format.args = list(big.mark = ",", scientific = FALSE)) |> 
+  kable_styling(latex_options = "HOLD_position", full_width = FALSE) |> 
+  # fix removal of indents by kableone
+  add_indent(c(10,11,12,13,15,16,17,18), level_of_indent = 1, all_cols = FALSE)
+```
+
+
+```{r}
+# Create ROC and AUC for the random forest model on test and training data.
+rf_probs_train <- predict(rf_model, newdata=train_all_cols[,-1], type="prob")
+rf_probs_test <- predict(rf_model, newdata=test_all_cols[,-1], type="prob")
+
+rf_roc_train <- roc(train_all_cols$inhosp_death, rf_probs_train[,2])
+rf_roc_test <- roc(test_all_cols$inhosp_death, rf_probs_test[,2])
+
+# Helper functions for ROC graphs
+gen_roc_set_plot <- function(set_roc, set_title){
+  ggroc(set_roc) + 
+  theme_classic() + 
+  geom_abline(intercept=1, slope=1, col="grey") +
+  labs(title=set_title, x="Specificity", y="Sensitivity") +
+  annotate("text", x=0.65, y=0.55, label=sprintf("AUC: %0.3f", auc(set_roc)))
+}
+
+gen_roc_plot <- function(roc_train, roc_test, figure_title){
+  grid.arrange(gen_roc_set_plot(roc_train, "Training Set"),
+               gen_roc_set_plot(roc_test, "Test Set"),
+               ncol=2, top = figure_title)
+}
+```
+
+There were a total of `r prettyNum(ncol(test_all_cols)-1, big.mark=",")` predictors considered when generating the random forest model.  Figure 1 illustrates the receiver operating characteristic (ROC) curves for the random forest model when applied to the training and test sets.  Notably, the area under the ROC (AUC) on the training set was 1.0, while the AUC on the test set was 0.815, indicating that there was substantial overfitting of the random forest on the training set.  Using the `importance` function from the `randomForest` package, `r length(important_features)` were selected for further consideration.  Of these, `r sum(str_starts(important_features, "proc_"))` were specific ICD10 procedure codes and `r sum(str_starts(important_features, "diag_"))` were ICD10 diagnosis codes, a significant reduction from the several thousand ICD10 codes under initial consideration.
+
+```{r}
+# The requirements for the random forest and logistic regression models are somewhat different,
+# so new data frames were required.
+lgr_train_df <- train |> 
+  select(subject_id, inhosp_death, age, sex, bmi, asa, department, antype, icd10_pcs) |> 
+  mutate(asa = as.factor(asa)) |>
+  left_join(labs_wide_train, by="subject_id") |> 
+  left_join(vitals_wide_train, by="subject_id") |>
+  left_join(diag_wide_train, by="subject_id")
+
+lgr_test_df <- test |> 
+  mutate(asa = as.factor(asa)) |>
+  select(subject_id, inhosp_death, age, sex, bmi, asa, department, antype, icd10_pcs) |> 
+  left_join(labs_wide_test, by="subject_id") |> 
+  left_join(vitals_wide_test, by="subject_id") |>
+  left_join(diag_wide_test, by="subject_id")
+
+lab_cols <- colnames(labs_wide_train)
+vitals_cols <- colnames(vitals_wide_train)
+diag_cols <- colnames(diag_wide_train)
+imprt_proc_icds <- str_remove(important_features[str_starts(important_features, "proc_")], "proc_")
+imprt_depts <- str_remove(important_features[str_starts(important_features, "dept_")], "dept_")
+
+
+forumula_str <- paste("inhosp_death ~ age + I(sex=='M') + bmi + I(asa==2) + I(asa==3) + I(asa==4) + antype +",
+                      paste(c(
+                        important_features[important_features %in% vitals_cols], 
+                        sprintf("I(department=='%s')", imprt_depts),
+                        important_features[important_features %in% lab_cols],
+                        sprintf("I(icd10_pcs=='%s')", imprt_proc_icds),
+                        important_features[important_features %in% diag_cols]
+                      ), collapse=" + "))
+
+lgr_model <- glm(as.formula(forumula_str), data=lgr_train_df, family=binomial)
+
+# Get predictions for roc graphs in the tables and figures section
+lgr_prob_train <- predict(lgr_model, type="response")
+lgr_prob_test <- predict(lgr_model, newdata = lgr_test_df, type="response")
+lgr_roc_train <- roc(lgr_train_df$inhosp_death, lgr_prob_train)
+lgr_roc_test <- roc(lgr_test_df$inhosp_death, lgr_prob_test)
+```
+
+When using the important features found by the random forests model, there is a notable improvement in the AUC applied to the test set to 0.870, at the cost of a reduction in training set AUC to 0.891, which is depicted in Figure 2.  When creating the final model that would be the most interpretable, it was noted that there were still many correlations between variables and several covariates had variance inflation factors (VIF) far above 2.   Based on this, several cofactors were eliminated.  For example hematocrit, hemoglobin concentration, and red blood cell count all essentially measure the same health feature of a patient's oxygen carrying capacity.  Based on the association with death according to the first logistic regression model, the number of covariates was reduced to 31 in the final model.  BMI was divided into categories of Underweight, Normal, Overweight, and Obese to account for possible non-linearity of BMI, but without losing interpretability that would occur with the use of polynomial terms or splines.  Anesthesia type of Neuraxial (which refers to epidural and spinal anesthetics) vs the other categories of General Anesthesia, Regional Anesthesia (using local anesthesia to block a peripheral nerve), and monitored anesthesia care  (MAC; typically sedation to the level that does not require an endotracheal tube or a laryngeal mask).  No vital sign was found to have a statistically significant association with in hospital mortality; 5 laboratory values, 4 procedures, and 16 diagnostic categories were found to be relevant according to these data, and included in the final model.
+
+
+```{r}
+
+# Treat some of the values as categorical variables, instead of regressing on their numeric values.
+add_categories <- function(df){
+  df |> mutate(asa_reduced=if_else(asa == 1 | asa == 2, "1or2", as.character(asa)),
+               bmi_cat=case_when(bmi < 18.5 ~ "Underweight",
+                                 bmi >= 25 & bmi < 30 ~ "Overweight",
+                                 bmi >= 30 ~ "Obese",
+                                 .default = "00_Normal"),
+               albumin_ref=case_when(albumin < 3.5 ~ "Low",
+                                      #albumin > 5.5 ~ "High",
+                                      .default="00_NotLow"),
+               chloride_ref=case_when(chloride < 98 ~ "Low",
+                                      #chloride > 106 ~ "High", 
+                                      .default="00_NotLow"),
+               fibrinogen_ref=case_when(#fibrinogen < 150 ~ "Low",
+                                        fibrinogen > 450 ~ "High",
+                                        .default="00_NotHigh"),
+               lymphocyte_ref=case_when(lymphocyte < 4.0 ~ "Low", 
+                                        #lymphocyte > 10 ~ "High", 
+                                        .default="00_NotLow"),
+               platelet_ref=case_when(platelet < 150 ~ "Low", 
+                                        #platelet > 350 ~ "High", 
+                                        .default="00_NotLow"),
+               )
+}
+lgr_train_df <-add_categories(lgr_train_df)
+lgr_test_df <-add_categories(lgr_test_df)
+
+# Final model after considerations on p value, vif, etc.
+lgr_final_model <- glm(inhosp_death ~ age + sex + asa_reduced 
+                      + bmi_cat
+                      + I(antype=="Neuraxial")
+                      + I(department=="CTS") 
+                      + albumin_ref
+                      + chloride_ref
+                      + fibrinogen_ref
+                      + lymphocyte_ref
+                      + platelet_ref
+                      + I(icd10_pcs == "0WJG0") + I(icd10_pcs == "0PB30") 
+                      + I(icd10_pcs == "0TBB4") + I(icd10_pcs == "0D164") 
+                      + diag_I20 + diag_M81 + diag_R31 + diag_Z93 + diag_C64 
+                      + diag_C22 + diag_C71 + diag_I07 + diag_I11 + diag_T82 
+                      + diag_N05 + diag_E87 + diag_L28 + diag_C92 + diag_C48
+                      + diag_T86,
+                      data=lgr_train_df, family=binomial)
+#car::vif(lgr_final_model)
+#summary(lgr_final_model)
+
+# Rename the variables so that they are more appropriate for the manuscript.
+summary_table <- tidy(lgr_final_model) |> slice(-1) |> 
+  mutate(estimate=exp(estimate),
+         conf.low=estimate*exp(-qnorm(0.975)*std.error),
+         conf.high=estimate*exp(qnorm(0.975)*std.error)) |>
+  select(term, estimate, conf.low, conf.high, p.value) |>
+  mutate(p.value=if_else(p.value < 0.01, 
+                         sprintf("%.2e", p.value), 
+                         sprintf("%.3f", p.value))) |>
+  mutate(term=case_when(term=="age" ~ "Age",
+                        term=="sexM" ~ "Male Sex",
+                        term=="asa_reduced3" ~ "ASA 3 (vs 1 or 2)",
+                        term=="asa_reduced4" ~ "ASA 4 (vs 1 or 2)",
+                        term=='bmi_catUnderweight' ~ "Underweight BMI (vs Normal)",
+                        term=='bmi_catOverweight' ~ "Overweight BMI (vs Normal)",
+                        term=='bmi_catObese' ~ "Obese BMI (vs Normal)",
+                        term=='I(antype == "Neuraxial")TRUE' ~ "Neuraxial Anesthesia (vs General/Regional/MAC)",
+                        term=='I(department == "CTS")TRUE' ~ "Cardiothoracic Surgery (vs All Other Departments)",
+                        term=="albumin_refLow" ~ "Low Albumin (< 3.5 g/dL)",
+                        term=="chloride_refLow" ~ "Low Chloride (< 98 mmol/L)",
+                        term=="fibrinogen_refHigh" ~ "High Fibrinogen (> 450 mg/dL)",
+                        term=="lymphocyte_refLow" ~ "Low Lymphocyte Count (< 4.0/ng)",
+                        term=="platelet_refLow" ~ "Low Platelet Count (< 150/ng)",
+                        term=='I(icd10_pcs == \"0WJG0\")TRUE' ~ 'Open Inspection of Peritoneal Cavity (0WJG0)',
+                        term=='I(icd10_pcs == \"0PB30\")TRUE' ~ 'Open Excision of Cervical Vertebra (0PB30)',
+                        term=='I(icd10_pcs == \"0TBB4\")TRUE' ~ 'Percutaneous Excision of Bladder (0TBB4)',
+                        term=='I(icd10_pcs == \"0D164\")TRUE' ~ 'Percutaneous Stomach Bypass (0D164)',
+                        term=='diag_I20' ~ 'Angina pectoris (I20)',
+                        term=='diag_M81' ~ 'Osteoporosis (M81)',
+                        term=='diag_R31' ~ 'Hematuria (R31)',
+                        term=='diag_Z93' ~ 'Artificial opening (Z93)',
+                        term=='diag_C64' ~ 'Malignant neoplasm of kidney (C64)',
+                        term=='diag_C22' ~ 'Malignant neoplasm of liver (C22)',
+                        term=='diag_C71' ~ 'Malignant neoplasm of brain (C71)',
+                        term=='diag_I07' ~ 'Rheumatic tricuspid valve disease (I07)',
+                        term=='diag_I11' ~ 'Hypertensive heart disease (I11)',
+                        term=='diag_T82' ~ 'Complications of cardiac and vascular prosthetic devices (T82)',
+                        term=='diag_N05' ~ 'Nephritic syndrome (N05)',
+                        term=='diag_E87' ~ 'Disorders of fluid, electrolyte and acid-base balance (E87)',
+                        term=='diag_L28' ~ 'Lichen simplex chronicus and prurigo (L28)',
+                        term=='diag_C92' ~ 'Myeloid leukemia (C92)',
+                        term=='diag_C48' ~ 'Malignant neoplasm of retroperitoneum and peritoneum (C48)',
+                        term=='diag_T86' ~ 'Complications of transplanted organs and tissue (T86)',
+                        .default=term)) |>
+  mutate("95% CI"=sprintf("(%0.2f to %0.2f)", conf.low, conf.high)) |>
+  rename("Covariate"=term, "p value"=p.value, "Odds Ratio"=estimate) |>
+  select("Covariate", "Odds Ratio", "95% CI", "p value")
+
+# Probablities and ROC values for final model.
+lgr_final_prob_train <- predict(lgr_final_model, type="response")
+lgr_final_prob_test <- predict(lgr_final_model, newdata = lgr_test_df, type="response")
+lgr_final_roc_train <- roc(lgr_train_df$inhosp_death, lgr_final_prob_train)
+lgr_final_roc_test <- roc(lgr_test_df$inhosp_death, lgr_final_prob_test)
+```
+
+The final logistic regression model contained 35 parameter estimates (including the intercept, 2 for ASA, and 3 for BMI).  The ROC curves are depicted in Figure 3.  When compared to the linear model using all important features, the AUC reduces from 0.892 to 0.864 in the training set.  VIF values were below two for all covariates in the final model.  In the test set, the change in AUC is from 0.866 to 0.858.  The odds ratio with 95% confidence intervals for each of these estimates are listed in Table 3.  When considering ASA physical status, ASA 2 patients are defined as having well controlled systemic disease and are considered healthy; there did not appear to be a difference between ASA 1 and ASA 2 patients in terms of survival; these two categories were combined for comparison.  ASA 3 patients had 2.08 times odds of in hopspital mortality when compared to ASA 1 or 2 patients (95% CI: 1.58 to 2.73), while ASA 4 patients showed an odds ratio of 3.11 (95% CI: 1.20 to 8.08).  Age should be interpreted as the odds ratio for a one unit change: the odds of in hospital death after surgery for a one year increase in age is 1.03 times the odds of death of of the current age, holding all other covariates constant, according to these data (95% CI: 1.02 to 1.04).  When considering gender, being categorized as male demonstrated a 1.80 fold odds of in hospital death compared to being categorized as female (95% CI: 1.42 to 2.28).  An underweight (< 18.5) BMI is associated with with an increased odds of death compared to normal BMI (OR: 2.21, 95% CI: 1.62 to 3.01), while being overweight showed a lower association (OR: 0.49, 95% CI 0.36 to 0.67); an Obese BMI did not show a statistically significant difference from normal BMI (OR: 0.84, 95% CI 0.47 to 1.52).  The diagnostic category for that showed the second highest odds ratio for in hospital mortality was "Artificial opening (Z93)", which refers to a patient having an artificially created opening such as a tracheotomy, cystostomy, or colostomy.
+
+# Discussion and Conclusion
+
+The three different models created here highlight the bias variance trade off.  The random forest model showed no bias on the training set, but the result was an ROC that was worse on the test set than simply using a subset of the predictors on a simpler model.  Moving to the final model that prioritized interpretability did cause a further reduction in ROC, but this reduction was modest and allowed for a model that is relatively easy to understand.  Using other techniques that balance bias and variance would likely have resulted in a model with much better predictive power on the test set than any of the models created here, but that was not explored at this time.
+
+The goal of the present project was to focus on elective surgery.  It is unclear, however, whether this was truly the group of patients represented here, and whether it is possible to properly make this selection based on information made available by INSPIRE.  Simply relying on the emergency indicator that was present in the `operations` table was insufficient, given that it was necessary to further exclude patients who were using ECMO and other highly invasive technologies prior to surgery.  In the final data, one of the predictors of mortality was the presence of complications from transplant.  There did not appear to be a way to determine if this was an indication for the patient's procedure; a patient going to the operating room due to organ rejection is not elective.  On the other hand, a patient who had undergone a transplant in the past that was complicated by rejection may later present for elective surgery.  Performing a similar project as this, but either on an anonymized data set that provides indicators with more clarity with respect to elective surgery, or with direct access to a full EMR might provide different results.
+
+Many of the covariates found to be associated with mortality in this data set appear to relate to severe disease such as having cancer, liver failure, or other disorders that cannot be reasonably reversed.  The procedures on these patients may not have been emergent, but it would not be reasonable to delay care for a patient in the hopes that they will be cured, particularly if the procedure is for palliation or managing the complications of a disease.
+
+This project should also be considered in its clinical context.  The INSPIRE dataset is from a single center in Korea.  As a consequence, all of the patients in this study were classified as "Asian".  The rate of Obesity in Korea, and in this dataset, is much lower than that found in the United States or other western countries, which may limit the generalizability.  There were some prognostic features that were not provided, such as smoking status, that would likely have been useful in making predictions and may have confounded the relationship between some of the covariates, such as BMI, and the outcome of operative mortality.  Smoking status was not documented in INSPIRE, however.
+
+"Vital Signs are vital" is a common phrase in medicine.  There did not, however, appear to be a relevant relationship between vital signs and in hospital mortality, and they were not included in the final model.  First, a lack of evidence does not indicate evidence for a lack of effect.  Even if it were, it should not be concluded that vital signs are not actually vital.  Given the attempt to remove emergency procedures from consideration, it is more likely that the lack of evidence for an effect on vital signs is that the personnel in Korea have the good judgment not to take a person to surgery in the presence of severe hypertension, hypoxemia, or pyrexia.  The absence in utility for commonly considered laboratory values may have a similar explanation.
+
+In summary, this study highlights many factors that are relevant to in-hospital mortality following non-emergency procedures and demonstrates the potential of EMR data in considering perioperative outcomes, but may be limited in generalizability and applicability to truly elective procedures.
+
+# Tables and Figures
+```{r}
+#| output: true
+table_1
+```
+
+```{r}
+#| output: true
+table_2
+```
+
+```{r}
+#| output: true
+summary_table |> 
+  kable(caption = "Odds Ratios of In Hospital Mortality", booktabs=TRUE, 
+        digits=2, align="llll") |> 
+  kable_styling(latex_options = "HOLD_position", full_width = FALSE) #|> 
+  #column_spec(1, width="8cm")
+```
+
+```{r fig.align='center'}
+#| output: true
+gen_roc_plot(rf_roc_train, rf_roc_test, "Figure 1: Random Forest ROC curves")
+```
+
+```{r fig.align='center'}
+#| output: true
+gen_roc_plot(lgr_roc_train, lgr_roc_test, "Figure 2: ROC Curves for Logistic Model With All Important Features")
+```
+
+```{r fig.align='center'}
+#| output: true
+gen_roc_plot(lgr_final_roc_train, lgr_final_roc_test, "Figure 3: ROC Curves for Final Logistic Regression Model")
+```
+\newpage
+# References
